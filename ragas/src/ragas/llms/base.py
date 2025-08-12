@@ -4,6 +4,7 @@ import logging
 import typing as t
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import asyncio
 
 from langchain_community.chat_models.vertexai import ChatVertexAI
 from langchain_community.llms import VertexAI
@@ -23,6 +24,7 @@ if t.TYPE_CHECKING:
     from langchain_core.messages import BaseMessage
     from langchain_core.prompt_values import PromptValue
     from llama_index.core.base.llms.base import BaseLLM
+    from pydantic import BaseModel
 
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,30 @@ class BaseRagasLLM(ABC):
         stop: t.Optional[t.List[str]] = None,
         callbacks: Callbacks = None,
     ) -> LLMResult: ...
+
+    def supports_structured_output(self, output_model: "type[BaseModel]") -> bool:
+        """Return True if this LLM wrapper can produce structured outputs for the given model.
+
+        Default is False. Concrete implementations may override.
+        """
+        return False
+
+    async def agenerate_prompt_structured(
+        self,
+        prompt: "PromptValue",
+        output_model: "type[BaseModel]",
+        n: int = 1,
+        temperature: t.Optional[float] = None,
+        callbacks: "Callbacks" = None,
+    ) -> t.List[t.Any]:
+        """Generate structured outputs based on the provided Pydantic model.
+
+        Implementations should return a list of parsed objects (e.g., pydantic model instances or dicts),
+        one per completion, preserving order.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement structured output generation"
+        )
 
     async def generate(
         self,
@@ -272,6 +298,77 @@ class LangchainLLMWrapper(BaseRagasLLM):
             self.langchain_llm.temperature = old_temperature  # type: ignore
 
         return result
+
+    def supports_structured_output(self, output_model: "type[BaseModel]") -> bool:
+        # Prefer LangChain's with_structured_output, available on many chat models
+        return hasattr(self.langchain_llm, "with_structured_output")
+
+    async def agenerate_prompt_structured(
+        self,
+        prompt: "PromptValue",
+        output_model: "type[BaseModel]",
+        n: int = 1,
+        temperature: t.Optional[float] = None,
+        callbacks: "Callbacks" = None,
+    ) -> t.List[t.Any]:
+        if not self.supports_structured_output(output_model):
+            raise NotImplementedError(
+                "Structured outputs are not supported by the underlying LangChain LLM."
+            )
+
+        # Adjust temperature if supported
+        old_temperature: float | None = None
+        if temperature is None:
+            temperature = self.get_temperature(n=n)
+        if hasattr(self.langchain_llm, "temperature"):
+            self.langchain_llm.temperature = temperature  # type: ignore
+            old_temperature = temperature
+
+        structured_llm = self.langchain_llm.with_structured_output(output_model)
+
+        # Prepare the input for invoke/ainvoke: prefer messages for chat, else string
+        invoke_input: t.Any
+        if hasattr(prompt, "to_messages"):
+            try:
+                invoke_input = prompt.to_messages()  # type: ignore[attr-defined]
+            except Exception:
+                # Fallback to string
+                invoke_input = prompt.to_string()
+        else:
+            # StringPromptValue exposes .to_string()/.text
+            invoke_input = getattr(prompt, "text", None) or prompt.to_string()
+
+        results: t.List[t.Any]
+        try:
+            # Prefer batch invocation if available; pass callbacks via config to avoid duplication
+            if hasattr(structured_llm, "abatch") and n > 1:
+                batch_inputs = [invoke_input] * n
+                if callbacks is not None:
+                    results = await structured_llm.abatch(batch_inputs, config={"callbacks": callbacks})  # type: ignore[attr-defined]
+                else:
+                    results = await structured_llm.abatch(batch_inputs)  # type: ignore[attr-defined]
+            else:
+                if n == 1:
+                    if callbacks is not None:
+                        single = await structured_llm.ainvoke(invoke_input, config={"callbacks": callbacks})  # type: ignore[attr-defined]
+                    else:
+                        single = await structured_llm.ainvoke(invoke_input)  # type: ignore[attr-defined]
+                    results = [single]
+                else:
+                    # Fallback: parallel single invocations
+                    coros = []
+                    for _ in range(n):
+                        if callbacks is not None:
+                            coros.append(structured_llm.ainvoke(invoke_input, config={"callbacks": callbacks}))  # type: ignore[attr-defined]
+                        else:
+                            coros.append(structured_llm.ainvoke(invoke_input))  # type: ignore[attr-defined]
+                    results = list(await asyncio.gather(*coros))
+        finally:
+            # reset the temperature to the original value
+            if old_temperature is not None and hasattr(self.langchain_llm, "temperature"):
+                self.langchain_llm.temperature = old_temperature  # type: ignore
+
+        return list(results)
 
     def set_run_config(self, run_config: RunConfig):
         self.run_config = run_config

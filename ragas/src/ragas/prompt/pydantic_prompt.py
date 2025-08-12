@@ -93,6 +93,7 @@ class PydanticPrompt(BasePrompt, t.Generic[InputModel, OutputModel]):
         stop: t.Optional[t.List[str]] = None,
         callbacks: t.Optional[Callbacks] = None,
         retries_left: int = 3,
+        structured: t.Literal["auto", True, False] = "auto",
     ) -> OutputModel:
         """
         Generate a single output using the provided language model and input data.
@@ -134,6 +135,7 @@ class PydanticPrompt(BasePrompt, t.Generic[InputModel, OutputModel]):
             stop=stop,
             callbacks=callbacks,
             retries_left=retries_left,
+            structured=structured,
         )
         return output_single[0]
 
@@ -146,6 +148,7 @@ class PydanticPrompt(BasePrompt, t.Generic[InputModel, OutputModel]):
         stop: t.Optional[t.List[str]] = None,
         callbacks: t.Optional[Callbacks] = None,
         retries_left: int = 3,
+        structured: t.Literal["auto", True, False] = "auto",
     ) -> t.List[OutputModel]:
         """
         Generate multiple outputs using the provided language model and input data.
@@ -187,32 +190,72 @@ class PydanticPrompt(BasePrompt, t.Generic[InputModel, OutputModel]):
             metadata={"type": ChainType.RAGAS_PROMPT},
         )
         prompt_value = PromptValue(text=self.to_string(processed_data))
-        resp = await llm.generate(
-            prompt_value,
-            n=n,
-            temperature=temperature,
-            stop=stop,
-            callbacks=prompt_cb,
+
+        # Choose structured decoding if supported/forced
+        use_structured = (
+            structured is True
+            or (
+                structured == "auto"
+                and hasattr(llm, "supports_structured_output")
+                and llm.supports_structured_output(self.output_model)  # type: ignore[arg-type]
+            )
         )
 
-        output_models = []
-        parser = RagasOutputParser(pydantic_object=self.output_model)
-        for i in range(n):
-            output_string = resp.generations[0][i].text
+        output_models: t.List[OutputModel] = []
+
+        if use_structured:
             try:
-                answer = await parser.parse_output_string(
-                    output_string=output_string,
-                    prompt_value=prompt_value,
-                    llm=llm,
+                logger.info(f"Using structured output for {self.name}")
+                structured_outputs = await llm.agenerate_prompt_structured(
+                    prompt=prompt_value,
+                    output_model=self.output_model,
+                    n=n,
+                    temperature=temperature,
                     callbacks=prompt_cb,
-                    retries_left=retries_left,
                 )
-                processed_output = self.process_output(answer, data)  # type: ignore
-                output_models.append(processed_output)
-            except RagasOutputParserException as e:
-                prompt_rm.on_chain_error(error=e)
-                logger.error("Prompt %s failed to parse output: %s", self.name, e)
-                raise e
+                for item in structured_outputs:
+                    # If provider returns dicts, coerce into pydantic model
+                    model_instance = (
+                        item
+                        if isinstance(item, self.output_model)
+                        else self.output_model(**item)  # type: ignore[arg-type]
+                    )
+                    processed_output = self.process_output(model_instance, data)  # type: ignore
+                    output_models.append(processed_output)
+            except Exception as e:
+                # Fall back to legacy parsing if structured path fails unexpectedly
+                logger.warning(
+                    "Structured decoding failed (%s). Falling back to parser.", e
+                )
+                use_structured = False
+
+        if not use_structured:
+            logger.info(f"Using legacy JSON parsing for {self.name}")
+            resp = await llm.generate(
+                prompt_value,
+                n=n,
+                temperature=temperature,
+                stop=stop,
+                callbacks=prompt_cb,
+            )
+
+            parser = RagasOutputParser(pydantic_object=self.output_model)
+            for i in range(n):
+                output_string = resp.generations[0][i].text
+                try:
+                    answer = await parser.parse_output_string(
+                        output_string=output_string,
+                        prompt_value=prompt_value,
+                        llm=llm,
+                        callbacks=prompt_cb,
+                        retries_left=retries_left,
+                    )
+                    processed_output = self.process_output(answer, data)  # type: ignore
+                    output_models.append(processed_output)
+                except RagasOutputParserException as e:
+                    prompt_rm.on_chain_error(error=e)
+                    logger.error("Prompt %s failed to parse output: %s", self.name, e)
+                    raise e
 
         prompt_rm.on_chain_end({"output": output_models})
         return output_models

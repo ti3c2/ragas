@@ -170,6 +170,7 @@ class LangchainLLMWrapper(BaseRagasLLM):
         run_config: t.Optional[RunConfig] = None,
         is_finished_parser: t.Optional[t.Callable[[LLMResult], bool]] = None,
         cache: t.Optional[CacheInterface] = None,
+        attempt_structured_output: bool = True,
     ):
         super().__init__(cache=cache)
         self.langchain_llm = langchain_llm
@@ -177,6 +178,7 @@ class LangchainLLMWrapper(BaseRagasLLM):
             run_config = RunConfig()
         self.set_run_config(run_config)
         self.is_finished_parser = is_finished_parser
+        self.attempt_structured_output = attempt_structured_output
 
     def is_finished(self, response: LLMResult) -> bool:
         """

@@ -93,7 +93,6 @@ class PydanticPrompt(BasePrompt, t.Generic[InputModel, OutputModel]):
         stop: t.Optional[t.List[str]] = None,
         callbacks: t.Optional[Callbacks] = None,
         retries_left: int = 3,
-        structured: t.Literal["auto", True, False] = "auto",
     ) -> OutputModel:
         """
         Generate a single output using the provided language model and input data.
@@ -135,7 +134,6 @@ class PydanticPrompt(BasePrompt, t.Generic[InputModel, OutputModel]):
             stop=stop,
             callbacks=callbacks,
             retries_left=retries_left,
-            structured=structured,
         )
         return output_single[0]
 
@@ -148,7 +146,6 @@ class PydanticPrompt(BasePrompt, t.Generic[InputModel, OutputModel]):
         stop: t.Optional[t.List[str]] = None,
         callbacks: t.Optional[Callbacks] = None,
         retries_left: int = 3,
-        structured: t.Literal["auto", True, False] = "auto",
     ) -> t.List[OutputModel]:
         """
         Generate multiple outputs using the provided language model and input data.
@@ -193,12 +190,9 @@ class PydanticPrompt(BasePrompt, t.Generic[InputModel, OutputModel]):
 
         # Choose structured decoding if supported/forced
         use_structured = (
-            structured is True
-            or (
-                structured == "auto"
-                and hasattr(llm, "supports_structured_output")
-                and llm.supports_structured_output(self.output_model)  # type: ignore[arg-type]
-            )
+            llm.attempt_structured_output
+            and hasattr(llm, "supports_structured_output")
+            and llm.supports_structured_output(self.output_model)  # type: ignore[arg-type]
         )
 
         output_models: t.List[OutputModel] = []

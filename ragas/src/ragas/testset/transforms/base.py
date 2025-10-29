@@ -175,9 +175,42 @@ class Extractor(BaseGraphTransformation):
         """
 
         async def apply_extract(node: Node):
+            # start of extraction (debug)
+            try:
+                logger.debug(
+                    "Extractor %s: starting on node %.6s\n"
+                    "Node text: %s\n",
+                    self.__class__.__name__,
+                    node.id,
+                    node.get_property("page_content"),
+                )
+            except Exception:
+                # logging must never break execution
+                pass
+
+            node_text = node.get_property("page_content")
             property_name, property_value = await self.extract(node)
             if node.get_property(property_name) is None:
                 node.add_property(property_name, property_value)
+                # successful extraction (debug)
+                try:
+                    # build a lightweight summary of the extracted value
+                    if isinstance(property_value, str):
+                        summary = f"str(len={len(property_value)})"
+                    elif hasattr(property_value, "__len__"):
+                        # covers list, dict, tuple, numpy arrays, etc.
+                        summary = f"{type(property_value).__name__}(len={len(property_value)})"
+                    else:
+                        summary = type(property_value).__name__
+
+                    logger.debug(
+                        f"Extractor {self.__class__.__name__}: added property '{property_name}' "
+                        f"to node {node.id:.6} ({summary});\n"
+                        f"Property value: {property_value}\n"
+                    )
+                except Exception:
+                    # logging must never break execution
+                    pass
             else:
                 logger.warning(
                     "Property '%s' already exists in node '%.6s'. Skipping!",

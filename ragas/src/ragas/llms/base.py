@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import typing as t
 from abc import ABC, abstractmethod
@@ -23,6 +24,7 @@ if t.TYPE_CHECKING:
     from langchain_core.messages import BaseMessage
     from langchain_core.prompt_values import PromptValue
     from llama_index.core.base.llms.base import BaseLLM
+    from pydantic import BaseModel
 
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,30 @@ class BaseRagasLLM(ABC):
         callbacks: Callbacks = None,
     ) -> LLMResult: ...
 
+    def supports_structured_output(self, output_model: "type[BaseModel]") -> bool:
+        """Return True if this LLM wrapper can produce structured outputs for the given model.
+
+        Default is False. Concrete implementations may override.
+        """
+        return False
+
+    async def agenerate_prompt_structured(
+        self,
+        prompt: "PromptValue",
+        output_model: "type[BaseModel]",
+        n: int = 1,
+        temperature: t.Optional[float] = None,
+        callbacks: "Callbacks" = None,
+    ) -> t.List[t.Any]:
+        """Generate structured outputs based on the provided Pydantic model.
+
+        Implementations should return a list of parsed objects (e.g., pydantic model instances or dicts),
+        one per completion, preserving order.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement structured output generation"
+        )
+
     async def generate(
         self,
         prompt: PromptValue,
@@ -98,26 +124,36 @@ class BaseRagasLLM(ABC):
         stop: t.Optional[t.List[str]] = None,
         callbacks: Callbacks = None,
     ) -> LLMResult:
-        """Generate text using the given event loop."""
+        """Generate text using the given event loop with retry logic for LLM finish failures."""
 
-        if temperature is None:
-            temperature = self.get_temperature(n)
+        async def _attempt_generation():
+            """Single attempt at generation with finish check."""
+            temp = temperature if temperature is not None else self.get_temperature(n)
+            result = await self.agenerate_text(
+                prompt=prompt,
+                n=n,
+                temperature=temp,
+                stop=stop,
+                callbacks=callbacks,
+            )
+            # Check there are no max_token issues
+            if not self.is_finished(result):
+                raise LLMDidNotFinishException()
+            return result
 
-        agenerate_text_with_retry = add_async_retry(
-            self.agenerate_text, self.run_config
-        )
-        result = await agenerate_text_with_retry(
-            prompt=prompt,
-            n=n,
-            temperature=temperature,
-            stop=stop,
-            callbacks=callbacks,
-        )
+        # Wrap the ENTIRE generation + finish check in retry logic
+        generate_with_retry = add_async_retry(_attempt_generation, self.run_config)
 
-        # check there are no max_token issues
-        if not self.is_finished(result):
-            raise LLMDidNotFinishException()
-        return result
+        try:
+            return await generate_with_retry()
+        except LLMDidNotFinishException as e:
+            # Add more context to the error after all retries exhausted
+            logger.error(
+                f"LLM failed to complete generation after {self.run_config.max_retries} retries. "
+                f"This may indicate GPU memory pressure, rate limits, or model issues. "
+                f"Consider reducing max_workers or increasing max_tokens."
+            )
+            raise e
 
 
 class LangchainLLMWrapper(BaseRagasLLM):
@@ -134,6 +170,7 @@ class LangchainLLMWrapper(BaseRagasLLM):
         run_config: t.Optional[RunConfig] = None,
         is_finished_parser: t.Optional[t.Callable[[LLMResult], bool]] = None,
         cache: t.Optional[CacheInterface] = None,
+        attempt_structured_output: bool = True,
     ):
         super().__init__(cache=cache)
         self.langchain_llm = langchain_llm
@@ -141,6 +178,7 @@ class LangchainLLMWrapper(BaseRagasLLM):
             run_config = RunConfig()
         self.set_run_config(run_config)
         self.is_finished_parser = is_finished_parser
+        self.attempt_structured_output = attempt_structured_output
 
     def is_finished(self, response: LLMResult) -> bool:
         """
@@ -272,6 +310,84 @@ class LangchainLLMWrapper(BaseRagasLLM):
             self.langchain_llm.temperature = old_temperature  # type: ignore
 
         return result
+
+    def supports_structured_output(self, output_model: "type[BaseModel]") -> bool:
+        # Prefer LangChain's with_structured_output, available on many chat models
+        return hasattr(self.langchain_llm, "with_structured_output")
+
+    async def agenerate_prompt_structured(
+        self,
+        prompt: "PromptValue",
+        output_model: "type[BaseModel]",
+        n: int = 1,
+        temperature: t.Optional[float] = None,
+        adjust_temperature: bool = False,
+        callbacks: "Callbacks" = None,
+    ) -> t.List[t.Any]:
+        if not self.supports_structured_output(output_model):
+            raise NotImplementedError(
+                "Structured outputs are not supported by the underlying LangChain LLM."
+            )
+
+        async def _attempt_structured_generation():
+            """Single attempt at structured generation."""
+            # Adjust temperature if supported
+            old_temperature: float | None = None
+            temp = temperature if temperature is not None else self.get_temperature(n=n)
+            if hasattr(self.langchain_llm, "temperature"):
+                old_temperature = self.langchain_llm.temperature
+                if adjust_temperature:
+                    self.langchain_llm.temperature = temp
+
+            structured_llm = self.langchain_llm.with_structured_output(output_model)
+
+            # Prepare the input for invoke/ainvoke: prefer messages for chat, else string
+            invoke_input: t.Any
+            if hasattr(prompt, "to_messages"):
+                try:
+                    invoke_input = prompt.to_messages()  # type: ignore[attr-defined]
+                except Exception:
+                    # Fallback to string
+                    invoke_input = prompt.to_string()
+            else:
+                # StringPromptValue exposes .to_string()/.text
+                invoke_input = getattr(prompt, "text", None) or prompt.to_string()
+
+            results: t.List[t.Any]
+            try:
+                # Prefer batch invocation if available; pass callbacks via config to avoid duplication
+                if hasattr(structured_llm, "abatch") and n > 1:
+                    batch_inputs = [invoke_input] * n
+                    if callbacks is not None:
+                        results = await structured_llm.abatch(batch_inputs, config={"callbacks": callbacks})
+                    else:
+                        results = await structured_llm.abatch(batch_inputs)
+                else:
+                    if n == 1:
+                        if callbacks is not None:
+                            single = await structured_llm.ainvoke(invoke_input, config={"callbacks": callbacks})
+                        else:
+                            single = await structured_llm.ainvoke(invoke_input)
+                        results = [single]
+                    else:
+                        # Fallback: parallel single invocations
+                        coros = []
+                        for _ in range(n):
+                            if callbacks is not None:
+                                coros.append(structured_llm.ainvoke(invoke_input, config={"callbacks": callbacks}))  # type: ignore[attr-defined]
+                            else:
+                                coros.append(structured_llm.ainvoke(invoke_input))
+                        results = list(await asyncio.gather(*coros))
+            finally:
+                # reset the temperature to the original value
+                if old_temperature is not None and hasattr(self.langchain_llm, "temperature"):
+                    self.langchain_llm.temperature = old_temperature
+
+            return list(results)
+
+        # Apply retry logic to structured generation
+        generate_structured_with_retry = add_async_retry(_attempt_structured_generation, self.run_config)
+        return await generate_structured_with_retry()
 
     def set_run_config(self, run_config: RunConfig):
         self.run_config = run_config
